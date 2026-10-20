@@ -1,6 +1,10 @@
 import argparse
 import os
-import sys
+import hashlib
+import json
+import shutil
+import subprocess
+import warnings
 
 import numpy as np
 import matplotlib
@@ -24,18 +28,39 @@ from sklearn.metrics import (
     calinski_harabasz_score,
     davies_bouldin_score,
 )
-from sklearn.mixture import GaussianMixture
 from scipy.optimize import linear_sum_assignment
 from sklearn.decomposition import PCA
 
-# Optional rpy2 for R::Mclust
+
+def _resolve_r_home():
+    current = os.environ.get("R_HOME")
+    libraries = ("bin/x64/R.dll", "lib/libR.so", "lib/libR.dylib")
+    if current and any(os.path.isfile(os.path.join(current, path)) for path in libraries):
+        return
+    rscript = shutil.which("Rscript")
+    if not rscript:
+        return
+    env = os.environ.copy()
+    env.pop("R_HOME", None)
+    try:
+        result = subprocess.run([rscript, "-e", "cat(R.home())"], env=env,
+                                capture_output=True, text=True, check=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return
+    home = result.stdout.strip()
+    if home and any(os.path.isfile(os.path.join(home, path)) for path in libraries):
+        if current:
+            warnings.warn(f"Invalid R_HOME={current!r}; using {home!r} from Rscript", stacklevel=2)
+        os.environ["R_HOME"] = home
+
+
+_resolve_r_home()
 try:
     import rpy2.robjects as robjects
     import rpy2.robjects.numpy2ri as numpy2ri
 
-    # numpy2ri.activate()
     HAS_RPY2 = True
-except Exception:
+except (ImportError, OSError):
     HAS_RPY2 = False
 
 
@@ -259,9 +284,7 @@ def spatial_knn_smooth_embedding(
     if k <= 0 or n_iter <= 0:
         return Z
 
-    nn = NearestNeighbors(n_neighbors=min(k + 1, Z.shape[0]), algorithm="auto")
-    nn.fit(spatial[:, :2])
-    neigh_ind = nn.kneighbors(return_distance=False)
+    neigh_ind = _spatial_neighbor_indices(spatial, k, include_self=True)
 
     Z_s = Z.copy()
     for _ in range(n_iter):
@@ -334,9 +357,9 @@ def spatial_knn_refine_labels(
     if k <= 0 or n_iter <= 0:
         return labels
 
-    nn = NearestNeighbors(n_neighbors=min(k + 1, labels.shape[0]), algorithm="auto")
-    nn.fit(spatial[:, :2])
-    neigh_ind = nn.kneighbors(return_distance=False)
+    neigh_ind = _spatial_neighbor_indices(spatial, k, include_self=False)
+    if neigh_ind.shape[1] == 0:
+        return labels
 
     y = labels
     for _ in range(n_iter):
@@ -347,6 +370,25 @@ def spatial_knn_refine_labels(
             y_new[i] = int(major)
         y = y_new
     return y.astype(int)
+
+
+def _spatial_neighbor_indices(spatial, k: int, include_self: bool) -> np.ndarray:
+    from sklearn.neighbors import NearestNeighbors
+
+    n = len(spatial)
+    if n == 0:
+        raise ValueError("spatial must contain at least one spot")
+    other = min(max(0, int(k)), n - 1)
+    if other == 0:
+        return np.arange(n)[:, None] if include_self else np.empty((n, 0), dtype=int)
+    xy = np.asarray(spatial)[:, :2]
+    nn = NearestNeighbors(n_neighbors=other + 1).fit(xy)
+    indices = nn.kneighbors(xy, return_distance=False)
+    result = np.empty((n, other + int(include_self)), dtype=int)
+    for i, row in enumerate(indices):
+        adjacent = row[row != i][:other]
+        result[i] = np.r_[i, adjacent] if include_self else adjacent
+    return result
 
 
 # ----------------------------------------------------------------------
@@ -375,13 +417,6 @@ def _resolve_scale_mode(n_obs: int, scale_mode: str) -> str:
     if n_obs <= 50000:
         return "medium"
     return "large"
-
-
-def _has_cli_flag(flag: str) -> bool:
-    for arg in sys.argv[1:]:
-        if arg == flag or arg.startswith(flag + "="):
-            return True
-    return False
 
 
 def _run_leiden(adata, **kwargs):
@@ -569,7 +604,7 @@ def robust_consensus_leiden(
 
 
 # ----------------------------------------------------------------------
-# Mclust (R) + fallback to sklearn GMM
+# Mclust (R)
 # ----------------------------------------------------------------------
 def mclust_R(x, num_cluster, modelNames=None, random_state=0):
     if not HAS_RPY2:
@@ -604,67 +639,22 @@ def cluster_with_mclust(Z: np.ndarray, k: int, random_state: int = 0, show_progr
         if show_progress:
             print(msg, flush=True)
 
-    if HAS_RPY2:
-        _log("[mclust] Using R::Mclust via rpy2... (this may take a while)")
-        t0 = time.time()
-        Z_use = np.asarray(Z, dtype=np.float64)
+    if not HAS_RPY2:
+        raise RuntimeError("mclust requires rpy2 and an R installation with the mclust package.")
 
-        _log("[mclust] Running Mclust() ...")
-        labels = mclust_R(
-            Z_use,
-            num_cluster=int(k),
-            modelNames=robjects.NULL,
-            random_state=random_state,
-        )
-        _log(f"[mclust] Done. elapsed={time.time()-t0:.2f}s")
-        return labels.astype(int)
-
-    from sklearn.decomposition import PCA
-    from sklearn.preprocessing import StandardScaler
-
-    _log("[mclust] rpy2 not available; fallback to sklearn GaussianMixture.")
+    _log("[mclust] Using R::Mclust via rpy2... (this may take a while)")
     t0 = time.time()
+    Z_use = np.asarray(Z, dtype=np.float64)
 
-    Z = np.asarray(Z, dtype=np.float64)
-
-    # Stage 1: PCA (optional)
-    if Z.shape[1] > 50:
-        n_components = 50
-        _log(f"[mclust] Stage 1/3: PCA {Z.shape[1]} -> {n_components} ...")
-        t1 = time.time()
-        pca = PCA(n_components=n_components, random_state=random_state)
-        Z_red = pca.fit_transform(Z)
-        _log(f"[mclust] PCA done. elapsed={time.time()-t1:.2f}s")
-    else:
-        _log(f"[mclust] Stage 1/3: skip PCA (dim={Z.shape[1]})")
-        Z_red = Z
-
-    # Stage 2: Standardize
-    _log("[mclust] Stage 2/3: StandardScaler ...")
-    t2 = time.time()
-    Z_std = StandardScaler().fit_transform(Z_red)
-    _log(f"[mclust] StandardScaler done. elapsed={time.time()-t2:.2f}s")
-
-    # Stage 3: GMM EM
-    cov_type = "full" if Z_std.shape[1] <= 32 else "diag"
-    _log(f"[mclust] Stage 3/3: GaussianMixture (k={k}, cov='{cov_type}') EM fitting ...")
-
-    gmm = GaussianMixture(
-        n_components=int(k),
-        covariance_type="diag",
+    _log("[mclust] Running Mclust() ...")
+    labels = mclust_R(
+        Z_use,
+        num_cluster=int(k),
+        modelNames=robjects.NULL,
         random_state=random_state,
-        n_init=50,
-        max_iter=2000,
-        reg_covar=1e-3,
-        init_params="kmeans",
-        verbose=1 if show_progress else 0,
-        verbose_interval=50,
     )
-    labels = gmm.fit_predict(Z_std)
-
-    _log(f"[mclust] GMM done. total elapsed={time.time()-t0:.2f}s")
+    _log(f"[mclust] Done. elapsed={time.time()-t0:.2f}s")
     return labels.astype(int)
-
 
 # ----------------------------------------------------------------------
 # Clustering dispatcher
@@ -689,6 +679,8 @@ def cluster_with_method(
     neighbors_backend: str = "auto",
     neighbors_gpu_device: str = "cuda",
     scale_mode: str = "auto",
+    kmeans_n_init: int | None = None,
+    kmeans_random_state: int = 0,
 ) -> np.ndarray:
 
     method = method.lower().strip()
@@ -697,17 +689,26 @@ def cluster_with_method(
 
     if method == "kmeans":
         k = n_clusters if n_clusters and n_clusters > 0 else _estimate_k(N)
-        kmeans_n_init = 10 if scale_mode_eff == "small" else 5
-        print(f"[cluster] KMeans, n_clusters={k}, n_init={kmeans_n_init}")
-        km = KMeans(n_clusters=k, n_init=kmeans_n_init, random_state=0)
-        labels = km.fit_predict(Z_spot).astype(int)
+        # None keeps the historical scale-dependent restart count; KMeans keeps
+        # the lowest-inertia restart, so larger values are label-free.
+        if kmeans_n_init is None:
+            kmeans_n_init = 10 if scale_mode_eff == "small" else 5
+        if int(kmeans_n_init) < 1:
+            raise ValueError("kmeans_n_init must be >= 1")
+        print(f"[cluster] KMeans, n_clusters={k}, n_init={kmeans_n_init}, random_state={kmeans_random_state}")
+        km = KMeans(n_clusters=k, n_init=int(kmeans_n_init), random_state=int(kmeans_random_state))
+        Z_use = Z_spot if use_rep is None else _get_rep_matrix(adata, use_rep)
+        labels = km.fit_predict(Z_use).astype(int)
         adata.obs[key_added] = labels
         adata.obs[key_added] = adata.obs[key_added].astype(int)
         adata.uns[f"{key_added}_params"] = {
             "method": "kmeans",
             "n_clusters": int(k),
             "n_init": int(kmeans_n_init),
+            "random_state": int(kmeans_random_state),
+            "inertia": float(km.inertia_),
             "scale_mode": str(scale_mode_eff),
+            "use_rep": use_rep,
         }
         return labels
 
@@ -843,7 +844,7 @@ def cluster_with_method(
 
     if method == "mclust":
         k = n_clusters if n_clusters and n_clusters > 0 else _estimate_k(N)
-        print(f"[cluster] Mclust/GMM, n_clusters={k}")
+        print(f"[cluster] Mclust, n_clusters={k}")
 
         rep = use_rep
         if rep is None:
@@ -1064,16 +1065,41 @@ def compute_metrics(
     return metrics
 
 
-def load_npz(npz_path: str):
-    """
-    More robust loader for *.for_cluster.npz:
-      - Try common embedding keys: 'Z', 'embedding', 'emb', 'X_emb', 'feat', ...
-      - If not found, fall back to first 2D float array.
-      - Try common obs_names keys: 'obs_names', 'cell_id', 'cells', 'barcodes'.
-      - Try common spatial keys: 'spatial', 'coords', 'xy', 'pos'.
-    """
-    npz = np.load(npz_path, allow_pickle=True)
-    keys = list(npz.files)
+def _verify_training_outputs(npz_path):
+    path = os.path.abspath(os.fspath(npz_path))
+    suffix = "_for_cluster.npz"
+    if not path.endswith(suffix):
+        raise ValueError("Project output must end in _for_cluster.npz; use external_npz for external inputs")
+    stem = path[:-len(suffix)]
+    marker = stem + ".SUCCESS"
+    if not os.path.isfile(marker):
+        raise ValueError(f"Missing completion manifest: {marker}; external/legacy NPZ requires external_npz")
+    with open(marker, encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    expected = {os.path.basename(stem + part) for part in (
+        "_for_cluster.npz", "_checkpoint.pt", "_training.json", "_none.h5ad")}
+    hashes = manifest.get("artifacts_sha256", {})
+    if not isinstance(hashes, dict) or set(hashes) != expected:
+        raise ValueError("Completion manifest must list exactly the four training artifacts")
+    for name, expected_hash in hashes.items():
+        artifact_path = os.path.join(os.path.dirname(path), name)
+        if not os.path.isfile(artifact_path):
+            raise ValueError(f"Missing completed artifact: {artifact_path}")
+        digest = hashlib.sha256()
+        with open(artifact_path, "rb") as artifact:
+            for block in iter(lambda: artifact.read(1024 * 1024), b""):
+                digest.update(block)
+        if digest.hexdigest() != expected_hash:
+            raise ValueError(f"Completion hash mismatch: {artifact_path}")
+
+
+def load_npz(npz_path: str, *, external_npz: bool = False):
+    """Load named embeddings; project outputs require a verified completion manifest."""
+    if not external_npz:
+        _verify_training_outputs(npz_path)
+    with np.load(npz_path, allow_pickle=False) as archive:
+        npz = {key: archive[key] for key in archive.files}
+    keys = list(npz)
     print(f"[load_npz] keys in {npz_path}: {keys}")
 
     # 1) embedding
@@ -1085,14 +1111,9 @@ def load_npz(npz_path: str):
             print(f"[load_npz] use '{k}' as embedding, shape={Z.shape}")
             break
     if Z is None:
-        for k in keys:
-            arr = npz[k]
-            if hasattr(arr, "ndim") and arr.ndim == 2 and np.issubdtype(arr.dtype, np.floating):
-                Z = arr
-                print(f"[load_npz] fallback: use '{k}' as embedding, shape={Z.shape}")
-                break
-    if Z is None:
         raise KeyError("Cannot find embedding matrix in npz (tried keys: 'Z', 'embedding', 'emb', 'X_emb', ...).")
+    if Z.ndim != 2 or not np.isfinite(Z).all():
+        raise ValueError("NPZ embedding must be a finite 2D array")
 
     # 2) obs_names
     obs_names = None
@@ -1105,6 +1126,8 @@ def load_npz(npz_path: str):
     if obs_names is None:
         obs_names = np.array([f"cell_{i}" for i in range(Z.shape[0])], dtype=str)
         print(f"[load_npz] obs_names not found, fallback to range index, len={len(obs_names)}")
+    if obs_names.shape != (Z.shape[0],) or np.unique(obs_names).size != obs_names.size:
+        raise ValueError("NPZ obs_names must be unique and match embedding rows")
 
     # 3) spatial
     spatial = None
@@ -1144,8 +1167,11 @@ def build_adata(
 ) -> ad.AnnData:
 
     # store embedding as main X
+    obs_names = np.asarray(obs_names).astype(str)
+    if obs_names.shape != (Z.shape[0],) or np.unique(obs_names).size != obs_names.size:
+        raise ValueError("obs_names must be unique and match embedding rows")
     adata = ad.AnnData(X=Z.copy())
-    adata.obs_names = obs_names.astype(str)
+    adata.obs_names = obs_names
 
     # also store embedding in obsm so robust consensus can use it
     Z32 = np.asarray(Z, dtype=np.float32)
@@ -1239,20 +1265,16 @@ def save_labels(obs_names, labels, out_path):
 # ----------------------------------------------------------------------
 # main
 # ----------------------------------------------------------------------
-def main():
-    parser = argparse.ArgumentParser()
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Cluster SASG-ST embeddings with fixed common settings.")
 
     parser.add_argument("--npz", required=True, help="Path to *.for_cluster.npz")
+    parser.add_argument("--external_npz", action="store_true",
+                        help="Explicitly load external/legacy NPZ without a training completion manifest.")
     parser.add_argument(
         "--method",
         choices=["kmeans", "leiden", "louvain", "robust", "mclust"],
-        default="kmeans",
-    )
-    parser.add_argument(
-        "--scale_mode",
-        choices=["auto", "small", "medium", "large"],
-        default="auto",
-        help="Budget preset by dataset size. 'auto' uses n_obs to choose small/medium/large.",
+        default="mclust",
     )
     parser.add_argument(
         "--n_clusters",
@@ -1269,20 +1291,8 @@ def main():
     parser.add_argument(
         "--knn_k",
         type=int,
-        default=15,
-        help="K for KNN graph on embedding.",
-    )
-    parser.add_argument(
-        "--neighbors_backend",
-        choices=["scanpy", "gpu", "auto"],
-        default="auto",
-        help="Neighbor graph backend: auto (default), scanpy, or gpu.",
-    )
-    parser.add_argument(
-        "--neighbors_gpu_device",
-        type=str,
-        default="cuda",
-        help="Torch device used by GPU neighbor backend (default: cuda).",
+        default=None,
+        help="K for KNN graph on embedding (default: 15/12/10 by spot count).",
     )
     parser.add_argument(
         "--out_prefix",
@@ -1308,67 +1318,6 @@ def main():
         help="If set, compute ACC via Hungarian matching.",
     )
     parser.add_argument(
-        "--w_spa",
-        type=float,
-        default=0.4,
-        help="Spatial weight for robust clustering (default 0.4).",
-    )
-    parser.add_argument(
-        "--w_emb",
-        type=float,
-        default=0.6,
-        help="Embedding weight for robust clustering (default 0.6).",
-    )
-    parser.add_argument(
-        "--robust_seeds",
-        type=int,
-        default=3,
-        help="Robust consensus seeds (base default: 3; auto-adjusted by --scale_mode if not explicitly set).",
-    )
-    parser.add_argument(
-        "--robust_smooth_iter",
-        type=int,
-        default=1,
-        help="Robust consensus smoothing iters (base default: 1; auto-adjusted by --scale_mode if not explicitly set).",
-    )
-    parser.add_argument(
-        "--robust_random_state",
-        type=int,
-        default=0,
-        help="Robust consensus: random_state (default: 0).",
-    )
-    parser.add_argument(
-        "--robust_res_list",
-        type=str,
-        default=None,
-        help=(
-            "Robust consensus: comma-separated resolution list, e.g. "
-            "'0.65,0.75,0.85,0.95'. If not set, auto list around --resolution."
-        ),
-    )
-    parser.add_argument(
-        "--robust_consensus_backend",
-        choices=["kmeans", "minibatch"],
-        default="kmeans",
-        help="Backend for robust consensus meta clustering (base default: kmeans; auto-adjusted by --scale_mode if not explicitly set).",
-    )
-    parser.add_argument(
-        "--robust_batch_size",
-        type=int,
-        default=8192,
-        help="Batch size for robust MiniBatchKMeans (used when --robust_consensus_backend=minibatch).",
-    )
-    parser.add_argument(
-        "--use_rep",
-        type=str,
-        default=None,
-        help=(
-            "Which representation to use for building the neighbor graph. "
-            "If None, use adata.X. If set, it can be a key in adata.obsm (e.g. 'X_emb', 'X_pca') "
-            "or a key in adata.layers."
-        ),
-    )
-    parser.add_argument(
         "--pca_dim",
         type=int,
         default=0,
@@ -1378,28 +1327,10 @@ def main():
         ),
     )
     parser.add_argument(
-        "--pca_seed",
-        type=int,
-        default=0,
-        help="Random seed for PCA (sklearn PCA random_state).",
-    )
-    parser.add_argument(
-        "--pca_key",
-        type=str,
-        default="X_pca",
-        help="Key name to store PCA representation in adata.obsm (default: X_pca).",
-    )
-    parser.add_argument(
         "--power",
         type=int,
         default=0,
         help="Graph propagation steps for 'power' embedding smoothing (0 = disable).",
-    )
-    parser.add_argument(
-        "--power_alpha",
-        type=float,
-        default=1.0,
-        help="Weight for smoothed features when power > 0, final = local + alpha * smoothed.",
     )
     parser.add_argument(
         "--smooth",
@@ -1407,27 +1338,9 @@ def main():
         help="Apply spatial KNN smoothing on embedding before clustering.",
     )
     parser.add_argument(
-        "--smooth_k",
-        type=int,
-        default=20,
-        help="K for spatial KNN smoothing (default 20).",
-    )
-    parser.add_argument(
-        "--smooth_iter",
-        type=int,
-        default=1,
-        help="Iterations for spatial KNN smoothing (default 1).",
-    )
-    parser.add_argument(
         "--refine",
         action="store_true",
         help="Refine cluster labels by spatial majority vote on A_spatial.",
-    )
-    parser.add_argument(
-        "--refine_iter",
-        type=int,
-        default=1,
-        help="Number of refinement iterations when --refine is set.",
     )
     parser.add_argument(
         "--refine_k",
@@ -1441,30 +1354,45 @@ def main():
         help="Merge tiny clusters into nearest large cluster by embedding centroid.",
     )
     parser.add_argument(
-        "--min_cluster_size",
+        "--kmeans_n_init",
         type=int,
-        default=50,
-        help="Minimum size threshold for clusters; smaller ones will be merged if --merge_small is set.",
-    )
-    parser.add_argument(
-        "--progress",
-        action="store_true",
-        help="Show progress messages for long steps (mclust/GMM/PCA).",
-    )
-    parser.add_argument(
-        "--metrics_rep",
-        type=str,
         default=None,
-        help="Representation used to compute Silhouette/CH/DB. Default: same as --use_rep after PCA.",
+        help="KMeans restarts; the lowest-inertia solution is kept (default: 10 for small data, else 5).",
+    )
+    parser.add_argument(
+        "--kmeans_random_state",
+        type=int,
+        default=0,
+        help="KMeans initialisation seed (default: 0).",
     )
 
-    args = parser.parse_args()
+    # Common settings from SASG-ST command templates in demo/.
+    parser.set_defaults(
+        scale_mode="auto",
+        neighbors_backend="auto",
+        neighbors_gpu_device="cuda",
+        w_spa=0.3,
+        w_emb=0.7,
+        robust_seeds=9,
+        robust_smooth_iter=0,
+        robust_random_state=0,
+        robust_batch_size=8192,
+        use_rep="emb",
+        pca_seed=0,
+        pca_key="X_pca",
+        power_alpha=0.5,
+        smooth_k=6,
+        smooth_iter=1,
+        refine_iter=1,
+        min_cluster_size=10,
+        progress=False,
+        metrics_rep=None,
+    )
+    return parser.parse_args(argv)
 
-    parsed_robust_res_list = None
-    if args.robust_res_list is not None:
-        s = args.robust_res_list.strip()
-        if s != "":
-            parsed_robust_res_list = [float(x) for x in s.split(",") if x.strip() != ""]
+
+def main():
+    args = parse_args()
 
     # Output prefix and folder
     if args.out_prefix is None:
@@ -1479,7 +1407,8 @@ def main():
     w_emb = float(args.w_emb)
 
     print("Loading npz...")
-    Z, obs_names, spatial, A_row, A_col, A_weight, rep_key_np = load_npz(args.npz)
+    Z, obs_names, spatial, A_row, A_col, A_weight, rep_key_np = load_npz(
+        args.npz, external_npz=args.external_npz)
     print(f"Embedding shape: {Z.shape}")
     print(f"[npz] rep_key = {rep_key_np}")
 
@@ -1490,6 +1419,10 @@ def main():
         print(f"Loading h5ad for labels: {args.h5}")
         try:
             adata_raw = sc.read_h5ad(args.h5)
+            if not adata_raw.obs_names.is_unique:
+                raise ValueError("H5AD obs_names must be unique before label merge")
+            if not adata.obs_names.is_unique:
+                raise ValueError("Embedding obs_names must be unique before label merge")
             if args.label_key not in adata_raw.obs:
                 print(
                     f"[warn] label_key '{args.label_key}' not found in h5ad.obs; "
@@ -1509,6 +1442,8 @@ def main():
                     adata_raw.obs[args.label_key].astype(str).values
                 )
                 print(f"Label '{args.label_key}' merged for {len(common)} cells.")
+        except ValueError:
+            raise
         except Exception as e:
             print(f"[warn] Failed to load/merge h5ad labels: {e}")
 
@@ -1585,20 +1520,11 @@ def main():
 
     scale_mode_eff = _resolve_scale_mode(int(adata.n_obs), args.scale_mode)
 
-    if not _has_cli_flag("--knn_k"):
+    if args.knn_k is None:
         args.knn_k = 15 if scale_mode_eff == "small" else (12 if scale_mode_eff == "medium" else 10)
 
-    if not _has_cli_flag("--neighbors_backend"):
-        args.neighbors_backend = "scanpy" if scale_mode_eff == "small" else "auto"
-
-    if not _has_cli_flag("--robust_seeds"):
-        args.robust_seeds = 5 if scale_mode_eff == "small" else (3 if scale_mode_eff == "medium" else 2)
-
-    if not _has_cli_flag("--robust_smooth_iter"):
-        args.robust_smooth_iter = 1 if scale_mode_eff in ("small", "medium") else 0
-
-    if not _has_cli_flag("--robust_consensus_backend"):
-        args.robust_consensus_backend = "kmeans" if scale_mode_eff in ("small", "medium") else "minibatch"
+    args.neighbors_backend = "scanpy" if scale_mode_eff == "small" else "auto"
+    args.robust_consensus_backend = "kmeans" if scale_mode_eff in ("small", "medium") else "minibatch"
 
     print(
         f"[scale] mode={scale_mode_eff}, n_obs={adata.n_obs}, "
@@ -1624,12 +1550,14 @@ def main():
         robust_seeds=args.robust_seeds,
         robust_smooth_iter=args.robust_smooth_iter,
         robust_random_state=args.robust_random_state,
-        robust_res_list=parsed_robust_res_list,
+        robust_res_list=None,
         robust_consensus_backend=args.robust_consensus_backend,
         robust_batch_size=args.robust_batch_size,
         neighbors_backend=args.neighbors_backend,
         neighbors_gpu_device=args.neighbors_gpu_device,
         scale_mode=scale_mode_eff,
+        kmeans_n_init=args.kmeans_n_init,
+        kmeans_random_state=args.kmeans_random_state,
     )
 
     adata.obs["cluster"] = labels.astype(int)

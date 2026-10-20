@@ -5,6 +5,10 @@ import torch
 import torch.nn as nn
 from typing import Optional, Tuple
 
+
+class InsufficientNegativeSupportError(RuntimeError):
+    """Requested negative quota cannot be drawn from the legal support."""
+
 def scipy_to_torch_coo(M: sp.coo_matrix) -> torch.Tensor:
     if not sp.isspmatrix_coo(M):
         M = M.tocoo()
@@ -22,16 +26,92 @@ def scipy_to_torch_coo(M: sp.coo_matrix) -> torch.Tensor:
     val = torch.tensor(np.asarray(M.data, dtype=np.float32), dtype=torch.float32)
     return torch.sparse_coo_tensor(idx, val, size=M.shape, dtype=torch.float32).coalesce()
 
-def normalize_rows_sparse_torch(M: torch.Tensor) -> torch.Tensor:
-    assert M.is_sparse
+def normalize_rows_absolute_torch(M: torch.Tensor) -> torch.Tensor:
+    """Row normalisation by absolute mass, preserving signed SNGG values."""
+    M = M.coalesce()
     rows = M.indices()[0]
     vals = M.values()
-    n = M.size(0)
-    rowsum = torch.zeros(n, dtype=torch.float32, device=vals.device).index_add_(0, rows, vals)
-    rowsum[rowsum == 0] = 1.0
-    scale = 1.0 / rowsum
-    vals = vals * scale[rows]
-    return torch.sparse_coo_tensor(M.indices(), vals, M.size(), dtype=torch.float32, device=vals.device).coalesce()
+    total = torch.zeros(M.size(0), dtype=vals.dtype, device=vals.device).index_add_(0, rows, vals.abs())
+    total[total == 0] = 1.0
+    vals = vals / total[rows]
+    return torch.sparse_coo_tensor(M.indices(), vals, M.size(), dtype=vals.dtype,
+                                   device=vals.device).coalesce()
+
+
+def masked_spot_component_operator(P: torch.Tensor, mask_idx: torch.Tensor, n_spot: int) -> torch.Tensor:
+    """Remove masked spots' spot-component edges in both directions and renormalise."""
+    P = P.coalesce()
+    rows, cols = P.indices()
+    masked = torch.zeros(P.size(0), dtype=torch.bool, device=P.device)
+    masked[mask_idx] = True
+    drop = (masked[rows] & (cols >= n_spot)) | (masked[cols] & (rows >= n_spot))
+    sparse = torch.sparse_coo_tensor(torch.stack([rows[~drop], cols[~drop]]), P.values()[~drop], P.size(),
+                                     dtype=P.dtype, device=P.device).coalesce()
+    return normalize_rows_absolute_torch(sparse)
+
+
+def deterministic_sparse_mm(P: torch.Tensor, H: torch.Tensor) -> torch.Tensor:
+    """Deterministic COO propagation used by the validated model."""
+    P = P.coalesce()
+    rows, cols = P.indices()
+    values = P.values().unsqueeze(1) * H.index_select(0, cols)
+    return torch.zeros(P.size(0), H.size(1), dtype=H.dtype, device=H.device).index_add_(0, rows, values)
+
+
+class RelationPairs:
+    """Separate spot-spot and spot-component relations of the augmented graph."""
+    def __init__(self, P: torch.Tensor, n_spot: int):
+        P = P.coalesce()
+        rows, cols = P.indices()
+        self.n_spot = int(n_spot)
+        ss = (rows < n_spot) & (cols < n_spot) & (rows != cols)
+        sf = (rows < n_spot) & (cols >= n_spot)
+        self.ss = torch.stack([rows[ss], cols[ss]], 1)
+        self.sf = torch.stack([rows[sf], cols[sf]], 1)
+        assoc = torch.zeros(n_spot, P.size(0) - n_spot, dtype=torch.bool, device=P.device)
+        assoc[self.sf[:, 0], self.sf[:, 1] - n_spot] = True
+        self.non_association = (~assoc).nonzero()
+
+    def positives(self, take: int):
+        half = int(take) // 2
+        ss = self.ss[torch.randperm(self.ss.size(0), device=self.ss.device)[:half]]
+        sf = self.sf[torch.randperm(self.sf.size(0), device=self.sf.device)[:int(take)-half]]
+        return ss, sf
+
+    def feature_negatives(self, num: int, scorer, Hs, hard_ratio: float, oversample: int,
+                          sampling_seed: int = 0, sampling_epoch: int = 0):
+        n_cand = max(int(num) * int(oversample), int(num) + 100)
+        support = int(self.non_association.size(0))
+        if support < int(num):
+            raise InsufficientNegativeSupportError(
+                f"SC legal support ({support}) is smaller than requested quota ({int(num)})"
+            )
+        take = min(n_cand, support)
+        base_seed = int(sampling_seed) + 1009 * int(sampling_epoch) + int(num) * 9176 + int(oversample) * 6113
+        gen = _local_generator(self.non_association.device, base_seed)
+        perm = torch.randperm(support, device=self.non_association.device, generator=gen)[:take]
+        cand = self.non_association[perm]
+        i, g = cand[:, 0], cand[:, 1] + self.n_spot
+        was_training = scorer.training
+        scorer.eval()
+        try:
+            with torch.inference_mode():
+                scores = scorer.edge_score(Hs, i, g)
+            if not torch.isfinite(scores).all():
+                raise FloatingPointError("Non-finite SC negative mining scores")
+        finally:
+            scorer.train(was_training)
+        k = int(num * float(hard_ratio))
+        hard = torch.topk(scores, k=k).indices
+        available = torch.ones(take, dtype=torch.bool, device=i.device)
+        available[hard] = False
+        rest = torch.where(available)[0]
+        if rest.numel() < num - k:
+            raise InsufficientNegativeSupportError("SC candidate pool exhausted before the random quota could be emitted")
+        rest_gen = _local_generator(rest.device, base_seed + int(num) * 104729 + int(hard_ratio * 1000))
+        rest = rest[torch.randperm(rest.numel(), device=rest.device, generator=rest_gen)[:num-k]]
+        pick = torch.cat([hard, rest])
+        return torch.stack([i[pick], g[pick]], 1)
 
 
 def _contains_linear_edges(linear_idx: torch.Tensor, pos_sorted: torch.Tensor) -> torch.Tensor:
@@ -69,7 +149,12 @@ def deterministic_weighted_sample(
     offset: int = 0,
 ) -> torch.Tensor:
     """
-    Strict-compatible weighted sampling without torch.multinomial().
+    Strict-compatible categorical sampling with replacement.
+
+    The previous implementation rounded weights into an ascending index
+    prefix, which was a deterministic schedule rather than a categorical
+    draw.  Inverse-CDF sampling preserves the requested distribution while
+    using a local generator so strict mode does not consume the global RNG.
     """
     assert prob.dim() == 1
     device = prob.device
@@ -78,32 +163,23 @@ def deterministic_weighted_sample(
     if n == 0 or num_samples <= 0:
         return torch.empty(0, dtype=torch.long, device=device)
 
-    weight = prob.float().clamp_min(0)
-    positive = weight > 0
-    if positive.any():
-        idx = torch.arange(n, device=device, dtype=torch.long)[positive]
-        p = weight[positive]
-        p = p / p.sum().clamp_min(1e-12)
-    else:
-        idx = torch.arange(n, device=device, dtype=torch.long)
-        p = torch.full((n,), 1.0 / max(1, n), dtype=torch.float32, device=device)
+    weight = prob.detach().float().clamp_min(0)
+    if not torch.isfinite(weight).all():
+        raise ValueError("sampling weights must be finite")
+    if not (weight > 0).any():
+        weight = torch.ones_like(weight)
 
-    scale = max(int(num_samples), 4096)
-    counts = torch.round(p * scale).to(torch.long)
-    counts = torch.clamp(counts, min=1)
-    expanded = torch.repeat_interleave(idx, counts)
-    if expanded.numel() == 0:
-        expanded = idx
-
-    anchor = int(idx[torch.argmax(p)].item()) if idx.numel() > 0 else 0
-    shift = int((offset + anchor * 131 + int(num_samples) * 17) % max(1, expanded.numel()))
-    expanded = torch.roll(expanded, shifts=shift)
-
-    if expanded.numel() >= num_samples:
-        return expanded[:num_samples]
-
-    repeat = (num_samples + expanded.numel() - 1) // expanded.numel()
-    return expanded.repeat(repeat)[:num_samples]
+    # The local seed is a pure function of the call, so CPU/CUDA strict runs
+    # do not advance or depend on the process-global RNG stream.
+    seed = (int(offset) * 1000003 + int(num_samples) * 9176 + n * 6113) % (2**63 - 1)
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+    # CUDA has no deterministic cumsum kernel under strict mode.  Build the
+    # tiny node CDF on CPU in float64, then move it back for the search.
+    cdf_cpu = torch.cumsum(weight.to("cpu", torch.float64), dim=0)
+    cdf = (cdf_cpu / cdf_cpu[-1].clamp_min(1e-300)).to(device)
+    u = torch.rand(int(num_samples), device=device, dtype=torch.float64, generator=generator)
+    return torch.searchsorted(cdf.contiguous(), u.contiguous(), right=True).clamp_max(n - 1).to(torch.long)
 
 
 def deterministic_row_weighted_sample(
@@ -132,6 +208,13 @@ def deterministic_row_weighted_sample(
         )
     return out
 
+
+def _local_generator(device, seed: int):
+    """Return a per-call generator without touching the process-global RNG."""
+    g = torch.Generator(device=device)
+    g.manual_seed(int(seed) % (2**63 - 1))
+    return g
+
 class CollaborativeEncoder(nn.Module):
     def __init__(
         self,
@@ -142,6 +225,8 @@ class CollaborativeEncoder(nn.Module):
         activation: nn.Module = nn.ReLU(),
     ):
         super().__init__()
+        if int(num_nodes) <= 0 or int(dim) <= 0 or int(K) < 1:
+            raise ValueError("num_nodes and dim must be positive; K must be >= 1")
         self.K = K
         self.activation = activation
 
@@ -161,7 +246,6 @@ class CollaborativeEncoder(nn.Module):
             assert init_embed.shape[0] == num_nodes
             in_dim = init_embed.shape[1]
             if in_dim == dim:
-                # old behavior
                 self.embed = nn.Parameter(init_embed)
             else:
                 # learnable projection: in_dim -> dim
@@ -197,7 +281,7 @@ class CollaborativeEncoder(nn.Module):
 
         Hs = [Hk]
         for k in range(self.K):
-            Hk = torch.sparse.mm(Ptilde, Hk)
+            Hk = deterministic_sparse_mm(Ptilde, Hk)
             Hk = self.lins[k](Hk)
             Hk = self.bns[k](Hk)
             Hk = self.activation(Hk)
@@ -208,6 +292,8 @@ class CollaborativeEncoder(nn.Module):
 class CrossLayerScorer(nn.Module):
     def __init__(self, dim: int = 64, K: int = 2, hidden: int = 128, activation: nn.Module = nn.ReLU()):
         super().__init__()
+        if int(dim) <= 0 or int(K) < 1 or int(hidden) < 4:
+            raise ValueError("dim must be positive, K >= 1, and hidden >= 4")
         in_dim = dim * (K + 1)
         self.mlp = nn.Sequential(
             nn.Linear(in_dim, hidden),
@@ -233,9 +319,7 @@ class CrossLayerScorer(nn.Module):
 def sample_negatives(
     P,  # torch sparse COO adjacency (E_coo)
     num_neg: int,
-    h: Optional[torch.Tensor] = None,
-    encoder: Optional[nn.Module] = None,
-    Ptilde: Optional[torch.Tensor] = None,
+    h: torch.Tensor,
     layer_ids: Optional[torch.Tensor] = None,
     layer_margin: int = 0,
     layer_gamma: float = 0.0,
@@ -248,17 +332,18 @@ def sample_negatives(
     normal_scales=None,        # (N,)  numpy or torch (robust scale per i)
     normal_margin: float = 0.0,  # min normalized normal-distance for negatives
     normal_gamma: float = 0.0,   # exp weight on normal-distance
-    deterministic_sampling: bool = True,
+    sampling_seed: int = 0,
+    sampling_epoch: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Negative sampling with optional:
       - layer-aware constraints (discrete layer_ids)
       - normal-aware constraints (continuous local normal distance; self-supervised)
       - Scheme-B hard mining (dot-product scoring) + random remainder
-      - strict-compatible deterministic weighted sampling
+      - deterministic, seed/epoch-specific weighted sampling
 
     P: sparse adjacency (torch.sparse_coo_tensor)
-    h: node embedding used for hardness scoring (if None, will compute via encoder+Ptilde once)
+    h: node embedding used for hardness scoring
     """
 
     # -------- basic checks --------
@@ -270,25 +355,22 @@ def sample_negatives(
     ii = E_coo.indices()[0]
     jj = E_coo.indices()[1]
     n_nodes = int(E_coo.size(0))
+    n_spot = int(np.asarray(spatial).shape[0]) if spatial is not None else None
     degrees = torch.bincount(ii, minlength=n_nodes) + torch.bincount(jj, minlength=n_nodes)
     prob = 1.0 / (degrees.float() + 1e-8)
+    if n_spot is None:
+        raise ValueError("spatial coordinates are required for spot negative sampling")
+    if not 0 < n_spot <= n_nodes:
+        raise ValueError(f"n_spot={n_spot} must be in (0, {n_nodes}]")
+    # SS negatives are spot-spot pairs; component nodes must not consume
+    # candidate draws that are discarded by the spot-only validity mask.
+    prob[n_spot:] = 0.0
     prob = prob / prob.sum()
 
     # ---- Existing edges as sorted linear index (vectorized membership test) ----
     pos_lin = torch.cat([ii * n_nodes + jj, jj * n_nodes + ii], dim=0).to(torch.long)
     pos_lin = torch.unique(pos_lin, sorted=True)
 
-    # ---- Prepare embeddings for hardness scoring ----
-    if h is None:
-        assert encoder is not None and Ptilde is not None, "Need `h` or (encoder + Ptilde)."
-        was_training = encoder.training
-        encoder.eval()
-        with torch.inference_mode():
-            Hs = encoder(Ptilde)
-            h = torch.cat(Hs, dim=1)
-        encoder.train(was_training)
-
-    assert h is not None
     # h should be on some device (likely cuda); we’ll sample indices on that device
     h_device = h.device
 
@@ -296,10 +378,11 @@ def sample_negatives(
     layer2idx = None
     layer_weight = None
     max_layer = None
-    n_spot = None
     if layer_ids is not None:
         if layer_ids.device != device:
             layer_ids = layer_ids.to(device)
+        if n_spot is not None and int(layer_ids.numel()) != n_spot:
+            raise ValueError("layer_ids and spatial must contain the same number of spots")
         n_spot = int(layer_ids.numel())
         max_layer = int(layer_ids.max().item()) if n_spot > 0 else None
 
@@ -309,19 +392,14 @@ def sample_negatives(
             lj_grid = torch.arange(max_layer + 1, device=device).unsqueeze(0)
             dist = (li_grid - lj_grid).abs()
 
-            layer_weight = torch.ones_like(dist, dtype=torch.float32)
+            allowed = torch.ones_like(dist, dtype=torch.bool)
             if int(layer_margin) > 0:
-                layer_weight = torch.where(
-                    dist >= int(layer_margin),
-                    layer_weight,
-                    torch.zeros_like(layer_weight),
-                )
+                allowed = dist >= int(layer_margin)
+            layer_weight = allowed.to(torch.float32)
             if float(layer_gamma) > 0:
-                layer_weight = torch.where(
-                    layer_weight > 0,
-                    torch.exp(float(layer_gamma) * dist.float()),
-                    torch.zeros_like(layer_weight),
-                )
+                log_weight = float(layer_gamma) * dist.float()
+                row_max = torch.where(allowed, log_weight, torch.full_like(log_weight, -torch.inf)).amax(dim=1, keepdim=True)
+                layer_weight = torch.where(allowed, torch.exp(log_weight - row_max), torch.zeros_like(log_weight))
 
             row_sum = layer_weight.sum(dim=1, keepdim=True)
             layer_weight = layer_weight / row_sum.clamp_min(1e-12)
@@ -357,6 +435,10 @@ def sample_negatives(
         assert sc.ndim == 1 and sc.numel() == xy.size(0)
 
     # ---- Generate candidates (oversample) ----
+    if int(num_neg) <= 0:
+        raise ValueError(f"num_neg must be positive; got {num_neg}")
+    if not 0.0 <= float(hard_ratio) <= 1.0:
+        raise ValueError(f"hard_ratio must lie in [0, 1]; got {hard_ratio}")
     n_cand = max(int(num_neg * oversample_factor), num_neg + 100)
 
     cand_i_parts = []
@@ -372,14 +454,9 @@ def sample_negatives(
         need = n_cand - collected
         batch = int(min(262144, max(base_batch, need * 2)))
 
-        # strict mode: avoid torch.multinomial on CUDA because it is not
-        # compatible with torch.use_deterministic_algorithms(True)
-        if deterministic_sampling:
-            i = deterministic_weighted_sample(prob, batch, offset=attempts * 17)
-            j = deterministic_weighted_sample(torch.roll(prob, shifts=1), batch, offset=attempts * 97)
-        else:
-            i = torch.multinomial(prob, num_samples=batch, replacement=True)
-            j = torch.multinomial(prob, num_samples=batch, replacement=True)
+        stream_offset = int(sampling_seed) + 1009 * int(sampling_epoch)
+        i = deterministic_weighted_sample(prob, batch, offset=stream_offset + attempts * 17)
+        j = deterministic_weighted_sample(prob, batch, offset=stream_offset + attempts * 97)
         is_adj = torch.zeros(batch, dtype=torch.bool, device=device)
 
         if layer_ids is not None and n_spot is not None and n_spot > 0 and layer_weight is not None:
@@ -388,20 +465,19 @@ def sample_negatives(
                 i_spot = i[spot_mask]
                 li_spot = layer_ids[i_spot]
 
-                # strict mode: avoid torch.multinomial on CUDA because it is not
-                # compatible with torch.use_deterministic_algorithms(True)
-                if deterministic_sampling:
-                    lj_spot = deterministic_row_weighted_sample(
-                        layer_weight,
-                        li_spot,
-                        offset=attempts * 193,
-                    )
-                else:
-                    lj_spot = torch.multinomial(layer_weight[li_spot], num_samples=1).squeeze(1)
+                lj_spot = deterministic_row_weighted_sample(
+                    layer_weight,
+                    li_spot,
+                    offset=stream_offset + attempts * 193,
+                )
                 is_adj_spot = torch.zeros(li_spot.numel(), dtype=torch.bool, device=device)
 
                 if (neg_adj_ratio is not None) and (float(neg_adj_ratio) > 0) and (max_layer is not None) and (max_layer >= 1):
-                    use_adj = torch.rand(li_spot.numel(), device=device) < float(neg_adj_ratio)
+                    adj_gen = _local_generator(
+                        device,
+                        stream_offset + 1931 * int(attempts),
+                    )
+                    use_adj = torch.rand(li_spot.numel(), device=device, generator=adj_gen) < float(neg_adj_ratio)
                     left_ok = li_spot > 0
                     right_ok = li_spot < max_layer
                     can_adj = use_adj & (left_ok | right_ok)
@@ -410,7 +486,7 @@ def sample_negatives(
                         li_adj = li_spot[can_adj]
                         left_adj = li_adj > 0
                         right_adj = li_adj < max_layer
-                        choose_right = torch.rand(li_adj.numel(), device=device) < 0.5
+                        choose_right = torch.rand(li_adj.numel(), device=device, generator=adj_gen) < 0.5
                         lj_adj = torch.where(
                             left_adj & right_adj,
                             torch.where(choose_right, li_adj + 1, li_adj - 1),
@@ -426,16 +502,19 @@ def sample_negatives(
                     cnt = int(lid_mask.sum().item())
                     pool = layer2idx[lid_int]
                     if pool.numel() > 0:
-                        ridx = torch.randint(0, pool.numel(), (cnt,), device=device)
+                        dest_gen = _local_generator(
+                            device,
+                            stream_offset + 2971 * int(attempts) + 997 * lid_int,
+                        )
+                        ridx = torch.randint(0, pool.numel(), (cnt,), device=device, generator=dest_gen)
                         j_spot[lid_mask] = pool[ridx]
                     else:
-                        j_spot[lid_mask] = torch.randint(0, n_spot, (cnt,), device=device)
-                        is_adj_spot[lid_mask] = False
+                        raise InsufficientNegativeSupportError(f"No destination support for layer bin {lid_int}")
 
                 j[spot_mask] = j_spot
                 is_adj[spot_mask] = is_adj_spot
 
-        valid = i != j
+        valid = (i != j) & (i < int(n_spot)) & (j < int(n_spot))
         lin = i * n_nodes + j
         valid &= ~_contains_linear_edges(lin, pos_lin)
 
@@ -458,7 +537,7 @@ def sample_negatives(
             collected += take
 
     if collected < num_neg:
-        raise RuntimeError(
+        raise InsufficientNegativeSupportError(
             f"Not enough negative candidates ({collected}) for num_neg={num_neg}. "
             f"Try reducing layer_margin/layer_gamma or increasing oversample_factor."
         )
@@ -466,14 +545,7 @@ def sample_negatives(
     # candidate index tensors (on h_device for scoring)
     cand_i_t = torch.cat(cand_i_parts, dim=0)
     cand_j_t = torch.cat(cand_j_parts, dim=0)
-    raw_cand_i_t = cand_i_t
-    raw_cand_j_t = cand_j_t
-
-    # ---- Hardness score: dot product ----
-    with torch.inference_mode():
-        scores = _pairwise_dot_scores(h, cand_i_t, cand_j_t)  # (n_cand,)
-
-    # ---- normal-aware: filter and/or reweight candidate scores ----
+    # ---- normal-aware: filter directed candidates before unordered de-duplication ----
     if normal_enabled:
         ci_cpu = cand_i_t.detach().to("cpu")
         cj_cpu = cand_j_t.detach().to("cpu")
@@ -498,39 +570,59 @@ def sample_negatives(
         # margin filter: only filter spot-spot pairs, keep all non-spot pairs
         if normal_margin > 0 and mask.any():
             keep = (~mask) | (d >= float(normal_margin))
+            keep_gpu = keep.to(h_device)
+            if int(keep_gpu.sum().item()) < num_neg:
+                raise InsufficientNegativeSupportError(
+                    "Normal-distance eligibility leaves fewer directed candidates than requested; "
+                    "filters are never silently relaxed."
+                )
+            cand_i_t = cand_i_t[keep_gpu]
+            cand_j_t = cand_j_t[keep_gpu]
+            d = d[keep]
+            mask = mask[keep]
+        normal_weight = torch.ones_like(d, dtype=torch.float32, device="cpu")
+        if normal_gamma > 0 and mask.any():
+            normal_weight[mask] = torch.exp(
+                (float(normal_gamma) * d[mask]).clamp(max=float(np.log(1e4)))
+            )
+    else:
+        normal_weight = None
 
-            # if too aggressive, relax once
-            if keep.sum().item() >= max(num_neg + 100, int(1.2 * num_neg)):
-                keep_gpu = keep.to(h_device)
-                cand_i_t = cand_i_t[keep_gpu]
-                cand_j_t = cand_j_t[keep_gpu]
-                scores = scores[keep_gpu]
-                d = d[keep]
-                mask = mask[keep]  # keep mask in sync
-            else:
-                # not enough kept; skip hard filtering this round
-                pass
+    # Filter direction-dependent constraints before unordered de-duplication.
+    # The retained orientation is the first deterministic candidate occurrence.
+    key = torch.minimum(cand_i_t, cand_j_t) * n_nodes + torch.maximum(cand_i_t, cand_j_t)
+    order = torch.argsort(key, stable=True)
+    keep = torch.ones(order.numel(), dtype=torch.bool, device=order.device)
+    if order.numel() > 1:
+        keep[1:] = key[order[1:]] != key[order[:-1]]
+    unique_order = order[keep]
+    cand_i_t = cand_i_t[unique_order]
+    cand_j_t = cand_j_t[unique_order]
+    if normal_weight is not None:
+        normal_weight = normal_weight[unique_order.cpu()]
+    if cand_i_t.numel() < num_neg:
+        raise InsufficientNegativeSupportError(
+            f"Legal unique negative pool ({cand_i_t.numel()}) is smaller than requested quota ({num_neg})"
+        )
 
-        # exp reweight: apply ONLY to spot-spot pairs; others weight=1
-        if normal_gamma > 0:
-            w = torch.ones_like(d, dtype=torch.float32, device="cpu")
-            if mask.any():
-                w[mask] = torch.exp(float(normal_gamma) * d[mask]).clamp(max=1e4)
-            scores = scores * w.to(h_device)
+    # ---- Hardness score: dot product ----
+    with torch.inference_mode():
+        scores = _pairwise_dot_scores(h, cand_i_t, cand_j_t)
+    if not torch.isfinite(scores).all():
+        raise FloatingPointError("Non-finite SS negative mining scores")
+    if normal_weight is not None:
+        scores = scores * normal_weight.to(h_device)
+        if not torch.isfinite(scores).all():
+            raise FloatingPointError("Non-finite weighted SS negative mining scores")
 
     # ---- Select final negatives: hard + random ----
     k_hard = int(num_neg * float(hard_ratio))
     k_hard = max(0, min(k_hard, num_neg))
 
-    # if after filtering we have fewer candidates than needed, fallback (should be rare)
+    # If filtering leaves too few candidates, fail explicitly rather than
+    # silently returning an illegal raw candidate pool.
     if scores.numel() < num_neg:
-        # fallback: ignore normal filter and just random sample from original cand lists
-        cand_i_t = raw_cand_i_t
-        cand_j_t = raw_cand_j_t
-        with torch.inference_mode():
-            scores = _pairwise_dot_scores(h, cand_i_t, cand_j_t)
-        if scores.numel() < num_neg:
-            raise RuntimeError(f"Too few candidates after filtering: {scores.numel()} < num_neg={num_neg}")
+        raise InsufficientNegativeSupportError(f"Too few legal candidates after filtering: {scores.numel()} < {num_neg}")
 
     hard_idx = torch.topk(scores, k=k_hard, largest=True).indices  # tensor on h_device
     chosen_i = cand_i_t[hard_idx]
@@ -541,13 +633,13 @@ def sample_negatives(
         hard_mask = torch.zeros(scores.numel(), dtype=torch.bool, device=h_device)
         hard_mask[hard_idx] = True
         pool = torch.where(~hard_mask)[0]
-        if pool.numel() == 0:
-            rand_idx = torch.randint(0, scores.numel(), (remaining,), device=h_device)
-        elif pool.numel() < remaining:
-            # if pool too small, sample with replacement
-            rand_idx = pool[torch.randint(0, max(1, pool.numel()), (remaining,), device=h_device)]
-        else:
-            rand_idx = pool[torch.randperm(pool.numel(), device=h_device)[:remaining]]
+        if pool.numel() < remaining:
+            raise InsufficientNegativeSupportError("Legal candidate pool exhausted before the random quota could be emitted")
+        gen = _local_generator(
+            h_device,
+            stream_offset + 9176,
+        )
+        rand_idx = pool[torch.randperm(pool.numel(), device=h_device, generator=gen)[:remaining]]
 
         chosen_i = torch.cat([chosen_i, cand_i_t[rand_idx]], dim=0)
         chosen_j = torch.cat([chosen_j, cand_j_t[rand_idx]], dim=0)
@@ -561,6 +653,8 @@ def sample_negatives(
 class FeatureDecoder(nn.Module):
     def __init__(self, in_dim: int, out_dim: int, hidden: int = 256, activation: nn.Module = nn.ReLU()):
         super().__init__()
+        if int(in_dim) <= 0 or int(out_dim) <= 0 or int(hidden) < 2:
+            raise ValueError("decoder input/output dimensions must be positive and hidden >= 2")
         self.mlp = nn.Sequential(
             nn.Linear(in_dim, hidden),
             nn.LayerNorm(hidden),
@@ -574,11 +668,12 @@ class FeatureDecoder(nn.Module):
     def forward(self, h: torch.Tensor) -> torch.Tensor:
         return self.mlp(h)
 
-@torch.no_grad()
 def node_embedding_from_layers(Hs, mode: str = "concat"):
     if mode == "concat":
         return torch.cat(Hs, dim=1)
     elif mode == "mean":
         return torch.stack(Hs, dim=0).mean(dim=0)
-    else:
+    elif mode == "last":
         return Hs[-1]
+    else:
+        raise ValueError(f"Unsupported embedding aggregation: {mode}")

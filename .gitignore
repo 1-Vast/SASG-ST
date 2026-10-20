@@ -57,3 +57,8 @@ SASG-ST-code-*.zip
 SASG-ST-upload-manifest.tsv
 SASG-ST-zenodo-draft.json
 zenodo_upload.py
+
+# Local research and synchronization workspaces
+/remote/
+/Revise/
+.vs/

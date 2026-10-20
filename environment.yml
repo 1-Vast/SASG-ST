@@ -7,8 +7,6 @@ channels:
 dependencies:
   - python=3.10
   - pytorch=2.5.0
-  - torchvision=0.20.*
-  - torchaudio=2.5.*
   - pytorch-cuda=12.1
   - numpy>=1.26,<2.0
   - scipy>=1.9
@@ -18,26 +16,17 @@ dependencies:
   - matplotlib>=3.6
   - plotly>=5.0
   - scikit-learn>=1.2
+  - threadpoolctl>=3.1
   - tqdm>=4.65
-  - scanpy>=1.9
+  - psutil>=5.9
+  - scanpy>=1.10
+  - python-igraph>=0.11,<0.12
+  - leidenalg>=0.10,<0.11
+  - louvain>=0.8,<0.9
   - anndata>=0.9
   - h5py>=3.8
   - umap-learn>=0.5
-  - louvain>=0.8
-  - leidenalg>=0.9
-  - python-igraph>=0.10
-  - r-base>=4.3
-  - r-mclust>=6.0
-  - rpy2>=3.5
   - pip>=23.0
+  - setuptools<81
   - pip:
-      - nvidia-ml-py
       - scikit-misc>=0.3
-      # PyG wheels must match PyTorch 2.5.0 + CUDA 12.1.
-      - --find-links https://data.pyg.org/whl/torch-2.5.0+cu121.html
-      - pyg_lib
-      - torch_scatter
-      - torch_sparse
-      - torch_cluster
-      - torch_spline_conv
-      - torch_geometric

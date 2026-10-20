@@ -5,11 +5,63 @@ import numpy as np
 import pandas as pd
 import scanpy as sc
 import scipy.sparse as sp
-import torch
 from anndata import AnnData
-from torch_geometric.nn import knn_graph, radius_graph
-from torch_geometric.utils import to_undirected
 from scipy.sparse.linalg import eigsh
+from threadpoolctl import threadpool_limits
+
+
+def _canonical_rank(obs_names, n: int) -> np.ndarray:
+    """Stable node ranks used to resolve equal-distance/eigenvalue ties."""
+    if obs_names is None:
+        return np.arange(n, dtype=np.int64)
+    names = np.asarray(obs_names, dtype="U")
+    if names.shape != (n,):
+        raise ValueError(f"obs_names must have shape ({n},), got {names.shape}")
+    if np.unique(names).size != n:
+        raise ValueError("obs_names must be unique")
+    order = np.argsort(names, kind="stable")
+    rank = np.empty(n, dtype=np.int64)
+    rank[order] = np.arange(n, dtype=np.int64)
+    return rank
+
+
+def _canonical_knn_adjacency(spatial, k: int, obs_names=None) -> sp.csr_matrix:
+    """Build a device-independent directed KNN graph with an explicit tie rule."""
+    from sklearn.neighbors import NearestNeighbors
+
+    xy = np.asarray(spatial, dtype=np.float64)
+    n = xy.shape[0]
+    if xy.ndim != 2 or xy.shape[1] != 2:
+        raise ValueError("spatial must be an (N, 2) array")
+    if not 1 <= int(k) < n:
+        raise ValueError(f"KNN k={k} invalid for {n} spots")
+    rank = _canonical_rank(obs_names, n)
+    d2, _ = NearestNeighbors(n_neighbors=2).fit(xy).kneighbors(xy)
+    spacing = float(np.median(d2[:, 1]))
+    if not np.isfinite(spacing) or spacing <= 0:
+        spacing = 1.0
+    # Query a small margin first; widen only when the kth rounded-distance
+    # tie crosses the query boundary.
+    m = min(n, int(k) + 31)
+    dist, idx = NearestNeighbors(n_neighbors=m).fit(xy).kneighbors(xy)
+    rows = np.empty(n * int(k), dtype=np.int64)
+    cols = np.empty(n * int(k), dtype=np.int64)
+    for i in range(n):
+        keep = idx[i] != i
+        dd = np.round(dist[i][keep] / spacing, 6)
+        jj = idx[i][keep]
+        if len(dd) > int(k) and dd[-1] <= dd[int(k) - 1] and m < n:
+            full_d, full_j = NearestNeighbors(n_neighbors=n).fit(xy).kneighbors(xy[i:i + 1])
+            keep2 = full_j[0] != i
+            dd = np.round(full_d[0][keep2] / spacing, 6)
+            jj = full_j[0][keep2]
+        order = np.lexsort((rank[jj], dd))
+        jj = jj[order[:int(k)]]
+        rows[i * int(k):(i + 1) * int(k)] = i
+        cols[i * int(k):(i + 1) * int(k)] = jj
+    A = sp.coo_matrix((np.ones(n * int(k), dtype=np.float32), (rows, cols)), shape=(n, n)).tocsr()
+    A.sort_indices()
+    return A
 
 def Cal_Spatial_Net(
     adata: AnnData,
@@ -21,35 +73,41 @@ def Cal_Spatial_Net(
     save_graph_csv: bool = True,
 ):
 
-    print("🚀 Calculating spatial neighbor graph (GPU-accelerated) ...")
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    coords = torch.tensor(adata.obsm["spatial"], dtype=torch.float32, device=device)
+    print("🚀 Calculating spatial neighbor graph ...")
     n_cells = adata.shape[0]
 
     if model == "KNN":
-        num_workers = 0 if device == "cuda" else min(os.cpu_count(), 16)
-        edge_index = knn_graph(
-            x=coords,
-            k=k_cutoff,
-            loop=False,
-            flow="target_to_source",
-            num_workers=num_workers,
+        # CPU float64 construction with a stable distance/rank tie rule avoids
+        # CPU/GPU torch_geometric tie-order differences.
+        A = _canonical_knn_adjacency(
+            np.asarray(adata.obsm["spatial"], dtype=np.float64),
+            int(k_cutoff),
+            obs_names=np.asarray(adata.obs_names, dtype="U"),
         )
     elif model == "Radius":
-        num_workers = 0 if device == "cuda" else min(os.cpu_count(), 16)
-        edge_index = radius_graph(
-            x=coords,
-            r=rad_cutoff,
-            loop=True,
-            flow="target_to_source",
-            num_workers=num_workers,
-        )
+        from sklearn.neighbors import NearestNeighbors
+
+        xy = np.asarray(adata.obsm["spatial"], dtype=np.float64)
+        if xy.ndim != 2 or xy.shape[1] != 2 or not np.isfinite(xy).all():
+            raise ValueError("spatial must be a finite (N, 2) array")
+        if rad_cutoff is None or not np.isfinite(rad_cutoff) or rad_cutoff <= 0:
+            raise ValueError("radius must be finite and positive")
+        if n_cells < 2:
+            raise ValueError("radius graph needs at least two spots")
+        neighbors = NearestNeighbors(radius=rad_cutoff).fit(xy).radius_neighbors(xy, return_distance=False)
+        rows, cols = [], []
+        for i, indices in enumerate(neighbors):
+            indices = indices[indices != i]
+            if len(indices) == 0:
+                raise ValueError(f"radius={rad_cutoff} leaves spot {adata.obs_names[i]} without a spatial neighbor")
+            rows.extend([i] * len(indices))
+            cols.extend(indices)
+        A = sp.csr_matrix((np.ones(len(rows), dtype=np.float32), (rows, cols)), shape=(n_cells, n_cells))
+        A.sort_indices()
     else:
         raise ValueError("❌ Unknown model type. Use 'KNN' or 'Radius'.")
 
-    edge_index = edge_index.cpu()
-    row, col = edge_index[0].numpy(), edge_index[1].numpy()
+    row, col = A.nonzero()
     G = pd.DataFrame({"Cell1": row, "Cell2": col})
 
     G["Cell1"] = G["Cell1"].astype(int)
@@ -84,8 +142,8 @@ def Cal_Spatial_Net(
         G.to_csv(csv_path, index=False)
         print(f"💾 Spatial graph saved to: {csv_path}")
 
-    print(f"✅ The graph contains {edge_index.shape[1]} edges, {n_cells} cells.")
-    print(f"Average neighbors per cell: {edge_index.shape[1] / n_cells:.2f}")
+    print(f"✅ The graph contains {A.nnz} edges, {n_cells} cells.")
+    print(f"Average neighbors per cell: {A.nnz / n_cells:.2f}")
 
     if return_data:
         return adata
@@ -96,7 +154,7 @@ def compute_pseudo_layer_ids_from_spatial(
     knn_k: int = 18,
     mode: str = "fiedler",
     binning: str = "quantile",
-    seed: int = 0,
+    obs_names=None,
 ):
     """
     Build pseudo-layer ids from spatial coordinates using graph Laplacian only.
@@ -114,15 +172,11 @@ def compute_pseudo_layer_ids_from_spatial(
     if mode.lower() != "fiedler":
         raise ValueError(f"Unsupported mode={mode}. Use mode='fiedler'.")
 
-    # ---- 1) build spatial kNN graph (undirected) ----
-    # torch_geometric.nn.knn_graph returns directed edges; we symmetrize later.
-    import torch
-    from torch_geometric.nn import knn_graph
+    dense_bytes = 8 * N * N
 
-    x = torch.tensor(spatial, dtype=torch.float32)
-    edge_index = knn_graph(x, k=int(knn_k), loop=False)  # (2, E)
-    row = edge_index[0].cpu().numpy()
-    col = edge_index[1].cpu().numpy()
+    # ---- 1) build spatial kNN graph (undirected) ----
+    directed = _canonical_knn_adjacency(spatial, int(knn_k), obs_names=obs_names)
+    row, col = directed.nonzero()
 
     # Symmetrize adjacency
     row2 = np.concatenate([row, col])
@@ -136,16 +190,46 @@ def compute_pseudo_layer_ids_from_spatial(
     D = sp.diags(deg, format="csr")
     L = (D - A).astype(np.float64)
 
-    # ---- 3) Fiedler vector (2nd smallest eigenvector) ----
-    # Smallest eigenvector is constant; we take the 2nd.
-    # eigsh may return unsorted; we sort by eigenvalue.
-    vals, vecs = eigsh(L, k=2, which="SM")
-    order = np.argsort(vals)
-    fiedler = vecs[:, order[1]].astype(np.float32)
+    rank = _canonical_rank(obs_names, N)
+    from scipy.sparse.csgraph import connected_components
+    n_components, _ = connected_components(A, directed=False, return_labels=True)
+    if n_components != 1:
+        raise ValueError(f"Fiedler graph must be connected; found {n_components} components")
+    if dense_bytes <= 256 * 1024**2:
+        from scipy.linalg import eigh
+        with threadpool_limits(limits=1):
+            vals, vecs = eigh(L.toarray(), subset_by_index=[0, min(2, N - 1)], driver="evr")
+        if vals.shape[0] < 3 or vals[1] - vals[0] <= 1e-9 or vals[2] - vals[1] <= 1e-9:
+            raise ValueError("Fiedler vector is not unique for this spatial graph")
+        fiedler = vecs[:, 1].astype(np.float64)
+    else:
+        v0 = np.cos((rank + 0.5) * np.pi / N)
+        with threadpool_limits(limits=1):
+            vals, vecs = eigsh(L, k=3, which="SM", v0=v0,
+                               tol=1e-8, maxiter=max(5000, N * 5))
+        order = np.argsort(vals)
+        if vals[order[1]] - vals[order[0]] <= 1e-9 or vals[order[2]] - vals[order[1]] <= 1e-9:
+            raise ValueError("Fiedler vector is not unique for this spatial graph")
+        fiedler = vecs[:, order[1]].astype(np.float64)
+        residual = np.linalg.norm(L @ fiedler - vals[order[1]] * fiedler)
+        if residual > 1e-5:
+            raise RuntimeError(f"Fiedler residual too large: {residual}")
+    rx = float(np.corrcoef(fiedler, spatial[:, 0])[0, 1])
+    ry = float(np.corrcoef(fiedler, spatial[:, 1])[0, 1])
+    if abs(rx) >= 0.1:
+        sign = np.sign(rx)
+    elif abs(ry) >= 0.1:
+        sign = np.sign(ry)
+    else:
+        tied = np.flatnonzero(np.abs(fiedler) == np.max(np.abs(fiedler)))
+        sign = np.sign(fiedler[tied[np.argmin(rank[tied])]])
+    fiedler *= sign if sign != 0 else 1.0
 
     # Normalize to a stable 0~1 pseudo-depth (rank-based is more robust)
     # This also removes sign ambiguity of eigenvectors.
-    ranks = np.argsort(np.argsort(fiedler))
+    order = np.lexsort((rank, fiedler))
+    ranks = np.empty(N, dtype=np.int64)
+    ranks[order] = np.arange(N, dtype=np.int64)
     pseudo_depth = ranks.astype(np.float32) / max(1, N - 1)
 
     # ---- 4) binning into pseudo layers ----
@@ -176,23 +260,45 @@ def scanpy_workflow(
     n_top_genes: Optional[Union[int, List]] = 3000,
     batch_key: Optional[str] = None,
     n_comps: Optional[int] = 50,
-    viz: Optional[bool] = True,
+    viz: Optional[bool] = False,
     resolution: Optional[float] = 0.8,
 ) -> AnnData:
 
-    # --- Step 1: select starting matrix (prefer raw counts) ---
-    start_from_counts = False
-    if "counts" in adata.layers:
-        adata.X = adata.layers["counts"].copy()
-        start_from_counts = True
+    matrices = {"X": adata.X, **{f"layers/{key}": value for key, value in adata.layers.items()}}
+    if adata.raw is not None:
+        matrices["raw.X"] = adata.raw.X
+    for name, matrix in matrices.items():
+        if matrix is not None:
+            values = matrix.data if sp.issparse(matrix) else np.asarray(matrix)
+            if not np.isfinite(values).all():
+                raise ValueError(f"{name} must be finite")
+
+    source = next((key for key in ("counts", "count") if key in adata.layers), None)
+    if source is not None:
+        if not looks_like_counts(adata.layers[source]):
+            raise ValueError(f"layers['{source}'] must contain nonnegative integer counts")
+        adata.X = adata.layers[source].copy()
+        source = f"layers/{source}"
     elif getattr(adata, "raw", None) is not None:
-        adata = adata.raw.to_adata()
-        start_from_counts = True
-    else:
-        if looks_like_counts(adata.X):
-            start_from_counts = True
+        raw_x = adata.raw.X
+        if looks_like_counts(raw_x):
+            adata = adata.raw.to_adata()
+            source = "raw/X"
+        elif looks_like_counts(adata.X):
+            source = "X"
+        elif call_hvg and isinstance(n_top_genes, int):
+            raise ValueError("raw.X is not count-like and X does not contain valid counts")
         else:
-            start_from_counts = False
+            source = "X/transformed"
+    elif looks_like_counts(adata.X):
+        source = "X"
+    elif call_hvg and isinstance(n_top_genes, int):
+        raise ValueError("seurat_v3 HVG requires raw counts in layers['counts'], layers['count'], raw.X, or X")
+    else:
+        source = "X/transformed"
+    start_from_counts = source != "X/transformed"
+    adata.uns["sasg_input_source"] = source
+    print(f"Expression source: {source}")
 
     # --- Step 2: optional filtering ---
     if filter_cell:
@@ -249,18 +355,22 @@ def scanpy_workflow(
         print("⚠️ Skip normalize/log1p. has_neg=", has_neg, " start_from_counts=", start_from_counts,
               " looks_like_counts=", is_counts_like)
 
-    # --- Step 6: convert sparse to dense and clean NaN/Inf ---
+    # --- Step 6: convert sparse to dense ---
     if sp.issparse(adata.X):
         adata.X = adata.X.toarray()
-    adata.X = np.nan_to_num(adata.X, nan=0.0, posinf=0.0, neginf=0.0)
+    if not np.isfinite(adata.X).all():
+        raise FloatingPointError("Non-finite expression after normalization")
 
     # --- Step 7: scale once only ---
     sc.pp.scale(adata, max_value=10)
+    if not np.isfinite(adata.X).all():
+        raise FloatingPointError("Non-finite expression after scaling")
 
-    # --- Step 8: PCA with NaN cleanup ---
+    # --- Step 8: PCA ---
     if n_comps > 0:
-        adata.X = np.nan_to_num(adata.X, nan=0.0, posinf=0.0, neginf=0.0)
         sc.tl.pca(adata, n_comps=n_comps, svd_solver="arpack")
+        if not np.isfinite(adata.obsm["X_pca"]).all():
+            raise FloatingPointError("Non-finite PCA features")
 
     # --- Step 9: optional visualization and clustering ---
     if viz:
@@ -277,60 +387,38 @@ def scanpy_workflow(
     return adata
 
 def looks_like_counts(X, max_check=200000):
-    import numpy as np
-    if hasattr(X, "toarray"):
-        Xs = X[:min(X.shape[0], 2000), :min(X.shape[1], 2000)].toarray()
-    else:
-        Xs = np.asarray(X[:min(X.shape[0], 2000), :min(X.shape[1], 2000)])
-    if Xs.min() < 0:
+    if X is None:
         return False
-    frac = np.abs(Xs - np.round(Xs))
-    return np.quantile(frac, 0.999) < 1e-3
+    values = X.data if sp.issparse(X) else np.asarray(X)
+    values = np.asarray(values)
+    if values.size == 0 or not np.issubdtype(values.dtype, np.number):
+        return False
+    flat = values.reshape(-1)
+    for start in range(0, flat.size, int(max_check)):
+        block = flat[start:start + int(max_check)]
+        if (not np.isfinite(block).all() or (block < 0).any() or
+                not np.allclose(block, np.round(block), rtol=0.0, atol=1e-3)):
+            return False
+    return True
 
-def compute_pseudo_layer_ids(
-    A, spatial, bins: int = 8,
-    method: str = "fiedler",
-    axis: int = 1,
-):
-    if str(method).lower() != "fiedler":
-        raise ValueError(f"Unsupported method={method}. Use method='fiedler'.")
-
-    A_sp = A.tocsr().astype(np.float32)
-    A_sp = A_sp.maximum(A_sp.T)  # make undirected
-
-    deg = np.asarray(A_sp.sum(axis=1)).ravel()
-    deg[deg == 0] = 1.0
-    D_inv_sqrt = sp.diags(1.0 / np.sqrt(deg))
-    L = sp.eye(A_sp.shape[0], dtype=np.float32) - D_inv_sqrt @ A_sp @ D_inv_sqrt
-
-    vals, vecs = eigsh(L, k=2, which="SM")
-    depth = vecs[:, 1].astype(np.float32)
-
-    dmin, dmax = float(depth.min()), float(depth.max())
-    denom = (dmax - dmin) if (dmax > dmin) else 1.0
-    depth01 = (depth - dmin) / denom
-    ids_np = np.clip((depth01 * bins).astype(np.int64), 0, bins - 1)
-    return ids_np
-
-def compute_local_normals_from_spatial(spatial: np.ndarray, knn_k: int = 10):
+def compute_local_normals_from_spatial(spatial: np.ndarray, knn_k: int = 10, obs_names=None):
 
     spatial = np.asarray(spatial, dtype=np.float32)
     assert spatial.ndim == 2 and spatial.shape[1] == 2
 
     N = spatial.shape[0]
-
-    # brute-force knn (N=3460 ok). If you prefer, replace with faiss/pyg knn.
-    # Compute squared distances
-    d2 = ((spatial[:, None, :] - spatial[None, :, :]) ** 2).sum(-1)
-    np.fill_diagonal(d2, np.inf)
-
-    knn_idx = np.argpartition(d2, kth=knn_k, axis=1)[:, :knn_k]  # (N, k)
+    xy = np.asarray(spatial, dtype=np.float64)
+    rank = _canonical_rank(obs_names, N)
+    adjacency = _canonical_knn_adjacency(xy, int(knn_k), obs_names=obs_names)
 
     normals = np.zeros((N, 2), dtype=np.float32)
     scales  = np.zeros((N,), dtype=np.float32)
 
     for i in range(N):
-        nb = spatial[knn_idx[i]]  # (k,2)
+        neighbors = adjacency.indices[adjacency.indptr[i]:adjacency.indptr[i + 1]]
+        distance = ((xy[neighbors] - xy[i]) ** 2).sum(axis=1)
+        neighbors = neighbors[np.lexsort((rank[neighbors], distance))]
+        nb = spatial[neighbors]  # (k,2)
         X = nb - nb.mean(axis=0, keepdims=True)  # center
         C = (X.T @ X) / max(1, X.shape[0])       # 2x2 covariance
 

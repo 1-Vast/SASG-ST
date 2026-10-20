@@ -21,10 +21,28 @@ def row_l1_normalize(mat: sp.csr_matrix) -> sp.csr_matrix:
     mat.data *= np.repeat(inv, np.diff(mat.indptr))
     return mat
 
+
+def row_abs_normalize(mat: sp.csr_matrix) -> sp.csr_matrix:
+    """Normalise signed rows by absolute mass without changing signs."""
+    mat = _as_csr_float32(mat, copy=True)
+    rowsum = np.asarray(abs(mat).sum(axis=1)).ravel()
+    rowsum[rowsum == 0] = 1.0
+    mat.data *= np.repeat(1.0 / rowsum, np.diff(mat.indptr))
+    return mat
+
 def topN_per_row(X: sp.csr_matrix, N: int) -> sp.csr_matrix:
     X = _as_csr_float32(X, copy=True)
     if N <= 0:
-        return sp.csr_matrix(X.shape, dtype=np.float32)
+        raise ValueError(f"topN must be >= 1; got {N}")
+
+    # A value larger than the available feature dimension used to be silently
+    # treated as "keep every feature".  That makes a run with a stale or
+    # mismatched preprocessing request impossible to audit, so reject it
+    # explicitly before constructing the graph.
+    if N > X.shape[1]:
+        raise ValueError(
+            f"topN={N} exceeds the available feature dimension {X.shape[1]}"
+        )
 
     indptr = X.indptr
     data = X.data
@@ -39,8 +57,11 @@ def topN_per_row(X: sp.csr_matrix, N: int) -> sp.csr_matrix:
         st = int(indptr[r])
         ed = int(indptr[r + 1])
         row_abs = np.abs(data[st:ed])
-        kth = row_abs.size - N
-        keep_rel = np.argpartition(row_abs, kth)[kth:]
+        # Stable tie handling: larger absolute values first, then the original
+        # column index.  The previous argpartition path could choose a
+        # different tied entry across BLAS/device implementations.
+        order = np.lexsort((X.indices[st:ed], -row_abs))
+        keep_rel = order[:N]
         row_keep = np.zeros(row_abs.size, dtype=np.bool_)
         row_keep[keep_rel] = True
         keep_mask[st:ed] = row_keep
@@ -88,6 +109,8 @@ def build_augmented_graph(
             scale_mode=layer_scale_mode,
             cutoff=layer_cutoff,
         )
+    else:
+        A = 0.5 * (A + A.T)
 
     if normalize_A:
         A = row_l1_normalize(A + sp.eye(N, format="csr"))
@@ -101,7 +124,7 @@ def build_augmented_graph(
         X = topN_per_row(X, topN)
 
     if normalize_X:
-        X = row_l1_normalize(X)
+        X = row_abs_normalize(X)
 
     G = X.shape[1]
     I = sp.eye(G, dtype=np.float32, format="csr")

@@ -15,9 +15,13 @@ conda env create -f environment.yml
 conda activate sasg-st
 ```
 
-The environment file installs PyTorch 2.5.0 with CUDA 12.1, PyG compiled
-extensions, Scanpy preprocessing dependencies, and R `mclust` for the
-`--method mclust` clustering path.
+The environment installs PyTorch 2.5.0 with CUDA 12.1 and Scanpy dependencies.
+For mclust clustering, install R and the optional dependencies:
+
+```bash
+Rscript -e 'install.packages("mclust", repos="https://cloud.r-project.org")'
+python -m pip install rpy2==3.5.17
+```
 
 ## Dataset Downloads
 
@@ -29,64 +33,46 @@ Download datasets from the original public sources:
 - Human Breast Cancer: https://singlecell.broadinstitute.org/single_cell/study/SCP1256/visium-demo-study
 - Mouse Embryo MOSTA: https://db.cngb.org/stomics/mosta/download/
 
-More detailed dataset links are listed in `dataset/README.md`.
+More detailed dataset links are listed in [dataset/README.md](dataset/README.md).
 
-## Usage and Reproduction
+## Usage
 
-Download DLPFC sample `151673` from spatialLIBD and place it at `dataset/DLPFC/151673.h5ad`.
+The example below uses DLPFC section `151675`, saved as `dataset/DLPFC/151675.h5ad`.
 
-Set deterministic runtime variables:
-
-```bash
-unset OMP_NUM_THREADS
-export OMP_NUM_THREADS=2
-export MKL_NUM_THREADS=2
-export OPENBLAS_NUM_THREADS=2
-export NUMEXPR_NUM_THREADS=2
-export NUMBA_THREADING_LAYER=workqueue
-export CUBLAS_WORKSPACE_CONFIG=:4096:8
-export CUDA_VISIBLE_DEVICES=0
-```
-
-Train SASG-ST embeddings:
+### Training
 
 ```bash
 python -m model.main \
-  --h5 "dataset/DLPFC/151673.h5ad" \
-  --out_prefix "outputs/DLPFC/151673/151673_base" \
-  --k 15 \
-  --use_scanpy_workflow --pca_comps 64 \
+  --h5 dataset/DLPFC/151675.h5ad \
+  --graph_model KNN \
+  --k 20 \
+  --alpha 0.5 \
+  --K 2 \
+  --dim 64 \
   --hidden 512 \
-  --lambda_recon 0.05 --mask_ratio_feat 0.3 \
   --epochs 1200 \
-  --layer_aware --no_layer_fallback \
-  --pseudo_layer_bins 7 --pseudo_layer_knn 20 \
-  --layer_gamma 3.0 \
-  --neg_hard_ratio 0.6 --neg_oversample 8 \
+  --lr 0.0001 \
+  --lambda_recon 2.0 \
+  --mask_ratio_feat 0.2 \
+  --layer_aware \
+  --layer_gamma 2.0 \
+  --neg_layer_margin 2 \
+  --neg_hard_ratio 0.3 \
+  --pseudo_layer_bins 7 \
   --normal_aware \
-  --normal_knn 30 \
-  --activation prelu --scheduler \
-  --lr 5e-4 --weight_decay 1e-4 \
+  --normal_margin 1.0 \
   --seed 42
 ```
 
-Cluster and evaluate:
+### Clustering and evaluation
 
 ```bash
 python -m model.cluster \
-  --npz "outputs/DLPFC/151673/151673_base.augK2_d64_for_cluster.npz" \
-  --h5 "dataset/DLPFC/151673.h5ad" \
-  --label_key "sce.layer_guess" \
+  --npz dataset/DLPFC/151675.augK2_d64_for_cluster.npz \
   --method mclust \
-  --use_rep emb \
-  --pca_dim 50 \
   --n_clusters 7 \
-  --smooth \
-  --smooth_k 6 \
-  --refine \
-  --refine_iter 2 \
-  --merge_small \
-  --min_cluster_size 30 \
-  --calc_acc \
-  --out_prefix "outputs/DLPFC/151673/151673_base_merge30"
+  --pca_dim 15 \
+  --h5 dataset/DLPFC/151675.h5ad \
+  --label_key sce.layer_guess \
+  --calc_acc
 ```

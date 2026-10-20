@@ -7,7 +7,7 @@ This repository does not commit raw datasets. Download the data from the origina
 - Source: spatialLIBD, LIBD Human DLPFC 10x Genomics Visium data.
 - URL: https://research.libd.org/spatialLIBD/
 - Interactive/raw-data portal: https://spatial.libd.org/spatialLIBD/
-- Use sample `151673` for the reproducibility command in `REPRODUCIBILITY.md`.
+- Use sample `151675` for the example in the repository [README](../README.md).
 - Required annotation for the reproduction command: `sce.layer_guess`.
 
 ## Mouse Brain Serial Sections
