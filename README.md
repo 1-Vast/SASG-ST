@@ -42,7 +42,7 @@ The example below uses DLPFC section `151675`, saved as `dataset/DLPFC/151675.h5
 ### Training
 
 ```bash
-python -m model.main \
+python main.py \
   --h5 dataset/DLPFC/151675.h5ad \
   --graph_model KNN \
   --k 20 \
